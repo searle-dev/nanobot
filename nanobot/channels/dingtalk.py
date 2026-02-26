@@ -66,12 +66,28 @@ class NanobotDingTalkHandler(CallbackHandler):
             sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
             sender_name = chatbot_msg.sender_nick or "Unknown"
 
-            logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
+            # Extract conversation info for group/private chat distinction
+            conversation_id = chatbot_msg.conversation_id or message.data.get("conversationId", "")
+            conversation_type = chatbot_msg.conversation_type or message.data.get(
+                "conversationType", DingTalkChannel.CONV_TYPE_PRIVATE
+            )
+
+            is_group = conversation_type == DingTalkChannel.CONV_TYPE_GROUP
+            logger.info(
+                "Received DingTalk message from {} ({}), type={}: {}",
+                sender_name, sender_id, "group" if is_group else "private", content
+            )
 
             # Forward to Nanobot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
-                self.channel._on_message(content, sender_id, sender_name)
+                self.channel._on_message(
+                    content=content,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    conversation_id=conversation_id,
+                    conversation_type=conversation_type,
+                )
             )
             self.channel._background_tasks.add(task)
             task.add_done_callback(self.channel._background_tasks.discard)
@@ -91,11 +107,12 @@ class DingTalkChannel(BaseChannel):
     Uses WebSocket to receive events via `dingtalk-stream` SDK.
     Uses direct HTTP API to send messages (SDK is mainly for receiving).
 
-    Note: Currently only supports private (1:1) chat. Group messages are
-    received but replies are sent back as private messages to the sender.
+    Supports both private (1:1) chat and group chat replies.
     """
 
     name = "dingtalk"
+    CONV_TYPE_PRIVATE = "1"
+    CONV_TYPE_GROUP = "2"
 
     def __init__(self, config: DingTalkConfig, bus: MessageBus):
         super().__init__(config, bus)
@@ -197,27 +214,43 @@ class DingTalkChannel(BaseChannel):
         if not token:
             return
 
-        # oToMessages/batchSend: sends to individual users (private chat)
-        # https://open.dingtalk.com/document/orgapp/robot-batch-send-messages
-        url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
-
-        headers = {"x-acs-dingtalk-access-token": token}
-
-        data = {
-            "robotCode": self.config.client_id,
-            "userIds": [msg.chat_id],  # chat_id is the user's staffId
-            "msgKey": "sampleMarkdown",
-            "msgParam": json.dumps({
-                "text": msg.content,
-                "title": "Nanobot Reply",
-            }, ensure_ascii=False),
-        }
-
         if not self._http:
             logger.warning("DingTalk HTTP client not initialized, cannot send")
             return
 
+        headers = {"x-acs-dingtalk-access-token": token}
+        metadata = msg.metadata or {}
+        conversation_type = metadata.get("conversation_type", self.CONV_TYPE_PRIVATE)
+        conversation_id = metadata.get("conversation_id", "")
+
         try:
+            if conversation_type == self.CONV_TYPE_GROUP and conversation_id:
+                # Group chat: use groupMessages/send API
+                # https://open.dingtalk.com/document/orgapp/the-robot-sends-a-group-message
+                url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+                data = {
+                    "robotCode": self.config.client_id,
+                    "openConversationId": conversation_id,
+                    "msgKey": "sampleMarkdown",
+                    "msgParam": json.dumps({
+                        "text": msg.content,
+                        "title": "Nanobot",
+                    }),
+                }
+            else:
+                # Private chat: use oToMessages/batchSend API
+                # https://open.dingtalk.com/document/orgapp/robot-batch-send-messages
+                url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+                data = {
+                    "robotCode": self.config.client_id,
+                    "userIds": [msg.chat_id],  # chat_id is the user's staffId
+                    "msgKey": "sampleMarkdown",
+                    "msgParam": json.dumps({
+                        "text": msg.content,
+                        "title": "Nanobot Reply",
+                    }, ensure_ascii=False),
+                }
+
             resp = await self._http.post(url, json=data, headers=headers)
             if resp.status_code != 200:
                 logger.error("DingTalk send failed: {}", resp.text)
@@ -226,21 +259,33 @@ class DingTalkChannel(BaseChannel):
         except Exception as e:
             logger.error("Error sending DingTalk message: {}", e)
 
-    async def _on_message(self, content: str, sender_id: str, sender_name: str) -> None:
+    async def _on_message(
+        self,
+        content: str,
+        sender_id: str,
+        sender_name: str,
+        conversation_id: str = "",
+        conversation_type: str = "1",
+    ) -> None:
         """Handle incoming message (called by NanobotDingTalkHandler).
 
         Delegates to BaseChannel._handle_message() which enforces allow_from
         permission checks before publishing to the bus.
         """
         try:
-            logger.info("DingTalk inbound: {} from {}", content, sender_name)
+            is_group = conversation_type == self.CONV_TYPE_GROUP
+            chat_id = conversation_id if is_group else sender_id
+
+            logger.info("DingTalk inbound: {} from {} ({})", content, sender_name, "group" if is_group else "private")
             await self._handle_message(
                 sender_id=sender_id,
-                chat_id=sender_id,  # For private chat, chat_id == sender_id
+                chat_id=chat_id,
                 content=str(content),
                 metadata={
                     "sender_name": sender_name,
                     "platform": "dingtalk",
+                    "conversation_type": conversation_type,
+                    "conversation_id": conversation_id,
                 },
             )
         except Exception as e:

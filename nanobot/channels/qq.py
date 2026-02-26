@@ -13,21 +13,22 @@ from nanobot.config.schema import QQConfig
 
 try:
     import botpy
-    from botpy.message import C2CMessage
+    from botpy.message import C2CMessage, GroupMessage
 
     QQ_AVAILABLE = True
 except ImportError:
     QQ_AVAILABLE = False
     botpy = None
     C2CMessage = None
+    GroupMessage = None
 
 if TYPE_CHECKING:
-    from botpy.message import C2CMessage
+    from botpy.message import C2CMessage, GroupMessage
 
 
 def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
     """Create a botpy Client subclass bound to the given channel."""
-    intents = botpy.Intents(public_messages=True, direct_message=True)
+    intents = botpy.Intents(public_messages=True, public_guild_messages=True, direct_message=True)
 
     class _Bot(botpy.Client):
         def __init__(self):
@@ -38,6 +39,9 @@ def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
 
         async def on_c2c_message_create(self, message: "C2CMessage"):
             await channel._on_message(message)
+
+        async def on_group_at_message_create(self, message: "GroupMessage"):
+            await channel._on_group_message(message)
 
         async def on_direct_message_create(self, message):
             await channel._on_message(message)
@@ -70,7 +74,7 @@ class QQChannel(BaseChannel):
         BotClass = _make_bot_class(self)
         self._client = BotClass()
 
-        logger.info("QQ bot started (C2C private message)")
+        logger.info("QQ bot started (C2C + group chat)")
         await self._run_bot()
 
     async def _run_bot(self) -> None:
@@ -100,16 +104,25 @@ class QQChannel(BaseChannel):
             logger.warning("QQ client not initialized")
             return
         try:
-            await self._client.api.post_c2c_message(
-                openid=msg.chat_id,
-                msg_type=0,
-                content=msg.content,
-            )
+            metadata = msg.metadata or {}
+            if metadata.get("msg_type") == "group":
+                await self._client.api.post_group_message(
+                    group_openid=metadata["group_openid"],
+                    msg_type=0,
+                    content=msg.content,
+                    msg_id=metadata.get("message_id"),
+                )
+            else:
+                await self._client.api.post_c2c_message(
+                    openid=msg.chat_id,
+                    msg_type=0,
+                    content=msg.content,
+                )
         except Exception as e:
             logger.error("Error sending QQ message: {}", e)
 
     async def _on_message(self, data: "C2CMessage") -> None:
-        """Handle incoming message from QQ."""
+        """Handle incoming C2C/direct message from QQ."""
         try:
             # Dedup by message ID
             if data.id in self._processed_ids:
@@ -130,3 +143,39 @@ class QQChannel(BaseChannel):
             )
         except Exception:
             logger.exception("Error handling QQ message")
+
+    async def _on_group_message(self, data: "GroupMessage") -> None:
+        """Handle incoming group @bot message from QQ."""
+        try:
+            # Dedup by message ID
+            if data.id in self._processed_ids:
+                return
+            self._processed_ids.append(data.id)
+
+            group_openid = data.group_openid
+            member_openid = data.author.member_openid
+
+            # Strip the leading @bot mention that botpy delivers as-is
+            content = (data.content or "").strip()
+            # The @mention typically appears as a leading slash or whitespace-prefixed segment
+            # botpy delivers it with a leading space after the mention; strip it
+            if content.startswith("/"):
+                content = content[1:].strip()
+            content = content.strip()
+            if not content:
+                return
+
+            logger.debug("QQ group message from {} in group {}", member_openid, group_openid)
+
+            await self._handle_message(
+                sender_id=member_openid,
+                chat_id=group_openid,
+                content=content,
+                metadata={
+                    "msg_type": "group",
+                    "group_openid": group_openid,
+                    "message_id": data.id,
+                },
+            )
+        except Exception as e:
+            logger.error("Error handling QQ group message: {}", e)
